@@ -1,0 +1,18 @@
+[Unit]
+Description=HAProxy Simple Agent
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/sysconfig/ha-agent
+StandardError=syslog
+SyslogIdentifier=ha-agent
+TimeoutStopSec=30
+Restart=always
+Type=simple
+User=ha-agent
+
+ExecStart=/usr/bin/python3 /usr/local/bin/ha-agent.py
+ExecStop=/bin/kill $MAINPID
+
+[Install]
+WantedBy=multi-user.target
