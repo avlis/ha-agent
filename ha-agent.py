@@ -66,18 +66,16 @@ def refresh_stats(refresh_interval, proc_prefix, cpu_weight, iow_weight, mem_wei
 
         #eprint('cpu {0:.3f}, iow {1:.3f}, mem {2:.3f}, final {3:.0f}%, file [{4}]'.format(cpu_free, cpu_iow, mem_free, final_stats, file_status))
 
-        if status_lock.acquire(blocking=True)
-            STATUS = '{0:.0f}% {1}\n'.format(final_stats, file_status)
-        if status_lock.locked:
-            status_lock.release()
+        status_lock.acquire()
+        STATUS = '{0:.0f}% {1}\n'.format(final_stats, file_status)
+        status_lock.release()
 
 def respond(c,addr):
     try:
-        if status_lock.acquire(blocking=True)
-            #eprint('sending [{0}] to {1}:{2}'.format(STATUS,addr[0],addr[1]))
-            c.send(str.encode(STATUS))
-        if status_lock.locked:
-            status_lock.release()
+        status_lock.acquire()
+        #eprint('sending [{0}] to {1}:{2}'.format(STATUS,addr[0],addr[1]))
+        c.send(str.encode(STATUS))
+        status_lock.release()
         c.close()
     except:
         eprint('error replying to [{0}:{1}]'.format(addr[0],addr[1]))
