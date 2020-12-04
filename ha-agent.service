@@ -1,6 +1,8 @@
 [Unit]
 Description=HAProxy Simple Agent
 After=network.target
+StartLimitInterval=120
+StartLimitBurst=5
 
 [Service]
 EnvironmentFile=/etc/sysconfig/ha-agent
@@ -8,6 +10,7 @@ StandardError=syslog
 SyslogIdentifier=ha-agent
 TimeoutStopSec=30
 Restart=always
+RestartSec=30
 Type=simple
 User=ha-agent
 
