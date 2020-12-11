@@ -1,5 +1,5 @@
 FROM alpine:latest
-ARG version="20201120-004"
+ARG version="20201211-001"
 LABEL version=${version}
 ENV VERSION=${version}
 ENV PROC_PREFIX="/host/proc"
