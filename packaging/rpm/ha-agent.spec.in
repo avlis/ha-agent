@@ -1,0 +1,256 @@
+# ha-agent rpm spec.
+#
+# Template: build-rpm.sh substitutes @VERSION@ and @RELEASE@, then runs
+# rpmbuild against the tarball it assembles from the source tree.
+# %dist comes from the build image (AlmaLinux 9 -> .el9), so the artifact says
+# which family it was packaged against.
+
+Name:           ha-agent
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
+Summary:        HAProxy agent reporting backend load and maintenance state
+License:        GPLv3+
+URL:            https://github.com/avlis/ha-agent
+Source0:        %{name}-%{version}.tar.gz
+
+# Reproducibility and reach, stated here rather than inherited from whatever
+# the build image's macros happen to say:
+#   - xz payload. el9 defaults to zstd, which rpm 4.14 on el8 cannot read; xz
+#     installs on el8 and up and is what the 2020 package carried.
+#   - clamped mtimes and BUILDTIME taken from SOURCE_DATE_EPOCH. rpm ships both
+#     of these off, so without them every rebuild differs in every timestamp.
+%define _binary_payload w7.xzdio
+%define _source_payload w7.xzdio
+%define clamp_mtime_to_source_date_epoch 1
+%define use_source_date_epoch_as_buildtime 1
+#   - BUILDHOST pinned. Left alone it is the host name of whatever runs
+#     rpmbuild: "localhost" inside a podman container, a container id inside a
+#     docker one, and a developer's laptop name anywhere else. Two builds of one
+#     commit then differ in the header for a reason that has nothing to do with
+#     the package, which is exactly the kind of difference that makes someone
+#     distrust a diff between artifacts.
+%define _buildhost localhost
+
+BuildArch:      noarch
+BuildRequires:  systemd-rpm-macros
+
+Requires:       python3
+Requires(pre):  shadow-utils
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+
+%global _description %{expand:
+Small agent for HAProxy's agent check on Linux backends. Each probe is answered
+with a weight percentage computed from CPU headroom, i/o wait and available
+memory, each factor individually weighted: HAProxy reads the number as a share
+of the weight configured for that server, so a larger number means more traffic
+and 0% acts as a drain. For instance i/o wait matters more on a database server
+than memory usage does, which is what the per-factor weights are for.
+
+Sampling runs on its own thread, separate from the thread that answers HAProxy,
+so a backend can be polled by several HAProxy instances without the polling
+itself showing up as load. When no sample can be taken the percentage is left
+out of the reply, so HAProxy keeps the weight it was given instead of following
+a number the agent can no longer support, and the reply is never empty, because
+an empty reply is an agent failure.
+
+When /etc/ha-agent.status exists, its first line is appended to the reply,
+which lets an operator drain or park a backend locally without taking it
+offline. See the agent-check section of the HAProxy documentation.}
+
+%description %_description
+
+%prep
+%setup -q
+
+%install
+rm -rf %{buildroot}
+install -d -m 0755 %{buildroot}%{_unitdir}
+install -d -m 0755 %{buildroot}%{_bindir}
+install -d -m 0755 %{buildroot}%{_mandir}/man1
+install -d -m 0755 %{buildroot}%{_sysconfdir}/sysconfig
+# The program keeps its python3 shebang and its mode; %{_bindir}, not
+# %{_prefix}/local: /usr/local is the administrator's hierarchy and the
+# packaging guidelines for this family exclude it from packages.
+install -m 0755 ha-agent.py                       %{buildroot}%{_bindir}/ha-agent
+install -m 0644 ha-agent.service                  %{buildroot}%{_unitdir}/ha-agent.service
+install -m 0644 config/ha-agent                   %{buildroot}%{_sysconfdir}/sysconfig/ha-agent
+install -m 0644 config/ha-agent.status            %{buildroot}%{_sysconfdir}/ha-agent.status
+# Installed uncompressed: rpm's own brp-compress step gzips man pages, which is
+# why %files globs the suffix below.
+install -m 0644 docs/ha-agent.1                   %{buildroot}%{_mandir}/man1/ha-agent.1
+
+%pre
+# No uid is written anywhere: useradd -r takes the next free id from the system
+# range in /etc/login.defs, so the package cannot collide with what the host
+# already allocated. The account is created here, before files land, and it is
+# deliberately never removed on erase (the Fedora rule: an account may own
+# files, and on this family other packages share it).
+getent group  ha-agent >/dev/null 2>&1 || groupadd -r ha-agent
+if ! getent passwd ha-agent >/dev/null 2>&1; then
+    useradd -r -g ha-agent -d / -M -s /sbin/nologin -c 'HAProxy load agent' ha-agent
+else
+    # An account left by the 2020 package (created with plain "useradd
+    # ha-agent") is a regular login account: uid from the user range, home in
+    # /home/ha-agent, /bin/sh. Fix the login shell and the home in the passwd
+    # record; leave the uid alone, because files on the host may already belong
+    # to it, and leave any directory on disk alone too.
+    account_shell=$(getent passwd ha-agent | cut -d: -f7)
+    account_home=$(getent passwd ha-agent | cut -d: -f6)
+    case $account_shell in
+        */nologin|*/false) ;;
+        *)
+            echo "ha-agent: ha-agent has login shell '$account_shell' (created by the 2020 package); setting it to /sbin/nologin." >&2
+            usermod -s /sbin/nologin ha-agent || true
+            ;;
+    esac
+    case $account_home in
+        /|"") ;;
+        *)
+            echo "ha-agent: ha-agent has home '$account_home' (created by the 2020 package); setting it to /. Nothing on disk was moved or removed." >&2
+            usermod -d / ha-agent || true
+            ;;
+    esac
+fi
+exit 0
+
+%post
+%systemd_post ha-agent.service
+
+%preun
+%systemd_preun ha-agent.service
+
+%postun
+# Stops on erase, reloads the unit files always, restarts on upgrade only when
+# the service was already running. All three handled by the distro macros,
+# which stay quiet in chroots and build roots.
+%systemd_postun_with_restart ha-agent.service
+
+%files
+%defattr(-,root,root,-)
+%license LICENSE
+%doc README.md
+%{_bindir}/ha-agent
+%{_unitdir}/ha-agent.service
+%{_mandir}/man1/ha-agent.1*
+%config(noreplace) %{_sysconfdir}/sysconfig/ha-agent
+# The status file is operator state: noreplace keeps a local drain flag through
+# an upgrade instead of silently resetting it to "ready".
+%config(noreplace) %{_sysconfdir}/ha-agent.status
+
+%changelog
+* Wed Nov 11 2026 Bruno Silva <avlis@onurb.com> - 1.3.2-1
+- A probe that sends a byte gets its reply. close() on a socket with unread
+  data in its receive queue sends RST, not FIN, and the reset discards the
+  reply bytes already written, so every prober that introduced itself got
+  nothing back on an idle machine: `echo | nc host 7777` measured 30 of 30
+  resets with the host's OutRsts up 33 over exactly those probes, and a client
+  that sends then half-closes (`nc -N`) got 0 replies in 600. No load was
+  involved, so the accept queue explained none of it, and HAProxy's
+  agent-check sends nothing - which is why no release since 2020 noticed while
+  every check by hand did. The agent now shuts its own half down after the
+  reply, so a reader sees where it ends, and reads back whatever was sent
+  before hanging up, bounded so no client can hold the accept loop.
+
+* Wed Nov 11 2026 Bruno Silva <avlis@onurb.com> - 1.3.1-1
+- Probes are answered from the accept loop, from the bytes the sampler publishes
+  once per interval. Each connection had a thread of its own, in front of a
+  listen backlog of 5: when arrivals outran thread creation the kernel dropped
+  connections (measured 465 of 2000 at 300 concurrent, TcpExtListenOverflows up
+  by as much), and the prober was left with a connection that was never served -
+  nothing back, which HAProxy logs as an empty agent reply and counts against the
+  agent. Load-dependent, so it read as intermittent: HAProxy checks every server
+  at once on a start and a reload, and a busy host drains the queue slower. Same
+  host, same minute, after the change: 2000 of 2000 answered, a tenth of the CPU
+  per probe.
+- No cap closes a connection without an answer (the 32-probe cap added in 1.2.0
+  shed load that way, which is this bug on purpose); listen backlog 5 -> 256.
+- An unreadable /proc no longer burns a core: the failed-sample path retried
+  immediately, the sample sleeping inside itself, measured at 1000 ms of CPU per
+  second for the whole outage. It waits out the interval now, and the tests
+  assert that an outage is cheap and that numbers return by themselves when the
+  prefix becomes readable.
+
+* Tue Nov 10 2026 Bruno Silva <avlis@onurb.com> - 1.3.0-1
+- A fourth factor in the reported weight, for a host whose work is done by an
+  accelerator rather than by the CPU: how much of the recent sampling the busiest
+  device in the box was not busy. Off by default (GPU_WEIGHT=0), and at 0 no
+  sysfs path is opened, so the answer is what CPU and memory say, as before. The
+  figure is read from /sys/class/drm/card*/device/gpu_busy_percent, which is the
+  number that device's own firmware computes for its activity level: no vendor,
+  no card and no device node is named, and no driver tool has to be installed.
+- That factor is averaged over GPU_SAMPLES readings (default 3) before use, and a
+  sample that cannot read the device clears the window instead of smoothing
+  across the gap. The device figure is a snapshot of something that moves in
+  seconds - measured going from 79% to 0% sixteen seconds apart while serving
+  inference - and the reply is a weight HAProxy redistributes traffic on.
+- A host whose driver exposes no such attribute is scored on the factors that did
+  answer, since the missing one leaves the divisor and the rest keep their
+  proportions: it is not counted as idle, which would hand a machine more traffic
+  for a device it does not have. The startup journal says what the agent could not
+  see. An accelerator exposing no percentage at all - an NPU, on the hardware
+  these boxes run on - is invisible to the factor, and the manual page says the
+  honest setting there is 0.
+- GPU_WEIGHT, GPU_SAMPLES and SYS_PREFIX in %%config and in the manual page,
+  checked against the names the program reads in both directions.
+
+* Tue Nov 10 2026 Bruno Silva <avlis@onurb.com> - 1.2.0-1
+- The last character of the state file is no longer chopped off the reply. A
+  /etc/ha-agent.status written without a final newline sent "drain" as "drai",
+  and HAProxy matches that word exactly, so the drained backend kept receiving
+  traffic. Line endings and blanks are stripped now.
+- "NAME=" in the configuration means the default rather than a crash: systemd
+  exports it as the empty string and os.getenv returns that instead of the
+  default. A value that is not a number, or is out of range, stops the agent
+  with one line naming it instead of a traceback; the weights are counts.
+- A load sample that cannot be taken no longer ends the sampling thread, and
+  with it the truth of every reply after it: the percentage is left out, so
+  HAProxy keeps the weight the administrator configured rather than following
+  the last number computed before the failure, and the drain word still works.
+  The reason is logged once, not once per interval.
+- The reply is never empty, so restarting the agent is not an agent-check
+  failure during the first REFRESH_INTERVAL seconds.
+- ECONNABORTED, EMFILE, ENFILE, ENOBUFS and EINTR from accept() are retried
+  instead of ending the service, and a bind failure names its cause.
+- HOST accepts IPv6 addresses; empty still means 0.0.0.0.
+- At most 32 probes answered at once, and the reply write no longer holds the
+  sampler's lock.
+- The unit sandboxes the agent (NoNewPrivileges, PrivateTmp, ProtectSystem,
+  RestrictAddressFamilies and the rest); it writes nothing.
+- BUILDHOST pinned to localhost. It came from the build container's host name,
+  which is "localhost" under podman and a container id under docker, so the
+  artifact was reproducible only as long as the same engine was used.
+- Source tarball assembled with sorted members and one fixed mtime.
+- ha-agent(1) and README name the percentage what HAProxy names it: a weight.
+
+* Tue Nov 10 2026 Bruno Silva <avlis@onurb.com> - 1.1.0-1
+- Program moved to /usr/bin/ha-agent (from /usr/local/bin/ha-agent.py): a
+  package installs under /usr, /usr/local is the administrator's hierarchy.
+- Unit reads both /etc/default/ha-agent and /etc/sysconfig/ha-agent, each
+  optional, so one unit file serves Debian-family and RHEL-family hosts.
+- Service account handled with useradd -r / usermod: uid from the system range,
+  and an account left by the 2020 package (login shell, home in the user range)
+  is corrected in place without touching its uid or files.
+- StartLimitIntervalSec/StartLimitBurst moved to [Unit]; added Group and
+  SyslogIdentifier; dropped the redundant ExecStop.
+- The prebuilt .rpm is removed from the repository: hand-built, unreproducible,
+  and superseded by building from source with ./package.sh into dist/.
+- A manual page, ha-agent(1), covering the environment variables and the drain
+  file, replacing the drift-prone list in README.md.
+- Metadata: License tag set, and LICENSE installed as %license with README.md
+  as %doc. The 2020 artifact carried neither: four files in total - program,
+  unit, two under /etc - with no licence text and no documentation.
+- Payload pinned to xz rather than the el9 default zstd, so the artifact still
+  installs where rpm 4.14 runs (el8). The 2020 package was xz as well; it is
+  written into the spec now, so it no longer depends on which image builds it.
+- Enablement is left to the distro presets, per this family's convention, and
+  RHEL 9 ships "disable *": after an install the unit is present but neither
+  enabled nor started until "systemctl enable --now ha-agent". The .deb, whose
+  family enables by default, does start it. README states both.
+- BUILDTIME and file mtimes taken from SOURCE_DATE_EPOCH: rebuilds of the same
+  commit are byte-identical.
+
+* Thu Dec 11 2020 Bruno Silva <avlis@onurb.com> - 1.0.0-1
+- Agent for HAProxy agent checks: reports weighted CPU/iowait/memory load and
+  the local maintenance state from /etc/ha-agent.status.

@@ -1,0 +1,38 @@
+#!/bin/sh
+# postrm for ha-agent
+#
+# Called as: postrm remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade
+set -e
+
+SERVICE=ha-agent.service
+
+case "$1" in
+    remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # Forget the enablement symlinks and the helper's state for this unit.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper purge "$SERVICE" >/dev/null 2>&1 || true
+            deb-systemd-helper unmask "$SERVICE" >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+if [ "$1" = purge ]; then
+    # The service account goes away on purge only; install and upgrade never
+    # touch an account that already exists. deluser leaves a group that other
+    # users still belong to and a home directory that still has content, so a
+    # host where the account was reused keeps working - it just says so.
+    if getent passwd ha-agent >/dev/null 2>&1; then
+        if ! deluser --system ha-agent >/dev/null 2>&1; then
+            echo "ha-agent: left user 'ha-agent' in place (still referenced elsewhere)." >&2
+        fi
+    fi
+    if getent group ha-agent >/dev/null 2>&1; then
+        delgroup --system ha-agent >/dev/null 2>&1 ||
+            echo "ha-agent: left group 'ha-agent' in place (still has members)." >&2
+    fi
+    # /etc/default/ha-agent and /etc/ha-agent.status are listed in conffiles:
+    # dpkg removes them on purge and keeps an edited copy with a warning.
+    # Nothing to delete here.
+fi
+
+exit 0

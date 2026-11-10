@@ -1,0 +1,286 @@
+.\" Man page for ha-agent.
+.\"
+.\" This source is uncompressed in the repository and compressed by the build:
+.\" the .deb carries /usr/share/man/man1/ha-agent.1.gz, the .rpm carries the
+.\" same file under %{_mandir}. Keep the environment names in step with the
+.\" os.getenv() calls in ha-agent.py: the lifecycle tests in packaging/tests
+.\" compare the two and fail on drift.
+.TH HA-AGENT 1 "" "ha-agent" "HAProxy backend agent"
+.SH NAME
+ha-agent \- report backend weight and maintenance state to HAProxy's agent check
+.SH SYNOPSIS
+.B ha-agent
+.SH DESCRIPTION
+.B ha-agent
+listens on a TCP port and answers each probe from HAProxy's
+.BR agent-check
+with the words that tell HAProxy how much traffic this backend should take, and
+whether its operator wants it to take any.
+
+The first word is a percentage: a share of the weight configured for the server
+in HAProxy. A larger number therefore sends this backend more traffic, and
+.B 0%
+is acted on as a drain, since a weight of zero takes the server out of the load
+balancing farm. The figure is built from measurements taken from
+.IR procfs ,
+each of them a fraction of headroom, and each weighted on its own: how much of
+the CPU is idle, how much of it is not waiting on i/o, and how much memory is
+available. A host is then tuned for what actually limits it, because i/o wait
+matters more on a database server than available memory does. A fourth fraction,
+how much of the recent sampling the busiest accelerator in the box was not busy,
+joins that average when it is asked for with
+.BR GPU_WEIGHT ;
+it comes from
+.I sysfs
+and it is off by default, since not every host has a device that reports one. Sampling runs on
+its own thread and a probe is answered from the sample on record, so polling by
+several HAProxy instances does not itself register as load, and a reply is at
+most
+.IR REFRESH_INTERVAL
+seconds old. Every connection the agent accepts is answered however fast they
+arrive: a probe is never turned away, because an empty reply is an agent-check
+failure, which costs whoever is polling more than waiting does.
+.P
+A probe does not have to send anything, and whatever it does send is read back
+and discarded. After the reply the agent shuts down its own half of the
+connection, so a reader sees where the reply ends, and it hangs up only once it
+has taken the prober's bytes: closing while a peer's data sits unread makes the
+kernel send a reset instead of a normal end, and a reset throws away the reply on
+its way to the reader - which is what an empty answer from
+.BR nc (1)
+usually is.
+
+Since every factor is headroom, an idle machine reports a high percentage and a
+busy one a low one. They are averaged by the sum of their weights, so ordinary
+CPU use moves the figure by tens of percent, and it only approaches
+.B 0%
+when available memory or i/o wait collapse - at which point the machine is not
+one to add traffic to.
+.P
+The program runs in the foreground and writes its own diagnostics to standard
+error; under
+.BR systemd (1)
+those lines reach the journal, tagged
+.B ha-agent
+by the unit's
+.BR SyslogIdentifier .
+It is not a syslog client and opens no syslog socket.
+It shuts down cleanly on
+.BR SIGTERM ", " SIGINT ,
+which is what
+.BR systemd (1)
+sends to stop it. It is normally started by the
+.B ha-agent.service
+unit installed alongside it.
+.SH REPLY
+The grammar is the one in the HAProxy configuration manual, section 5.2, under
+.IR agent-check :
+words separated by spaces, where a percentage sets the weight and
+.BR ready ", " drain ", " maint
+set the administrative state. The kinds of word are independent of one another,
+which is what allows this agent to say nothing about something it does not know.
+.TP
+.B percentage
+sent while load samples are being taken. When a sample cannot be taken - procfs
+unreadable, a kernel reporting nonsense - the percentage is left out and nothing
+else in the reply changes. HAProxy then keeps the weight its administrator
+configured instead of following the last figure computed before the failure. The
+journal says why, once, and says so again when sampling works.
+.TP
+.B "state word"
+the first line of
+.IR /etc/ha-agent.status ,
+read on every pass, including the passes where the sample failed: a drained
+backend stays drained even when the kernel side is unreadable. With nothing in
+that file the agent sends no state word, so it does not undo a state that was
+set on HAProxy's side by hand.
+.TP
+.B "never empty"
+a reply with no bytes in it is an agent-check failure, and after
+.I agent-fall
+of those the server leaves rotation. So the reply always carries something: in
+the first
+.B REFRESH_INTERVAL
+seconds after a start there is no sample yet, and if the state file says nothing
+either, the reply is
+.BR ready .
+.SH ENVIRONMENT
+There are no command line options. All configuration comes from the environment,
+which
+under
+.BR systemd (1)
+is read from
+.I /etc/default/ha-agent
+(Debian and Ubuntu) or
+.I /etc/sysconfig/ha-agent
+(RHEL and friends). Both paths are read, each one optional, so the same unit
+file works on either family. Each line is
+.BR "KEY=value" :
+no shell expansion and no command substitution.
+.P
+Every value below is an integer. A value that is set but empty means the default
+and the fallback is logged, so blanking a line is a way to unset it. A value that
+is not an integer, or is outside its range, stops the agent at startup with one
+line naming it;
+.IB systemd
+then retries on its restart schedule, so read the journal before assuming a
+network problem.
+.TP
+.B PORT
+TCP port to listen on. Default
+.BR 7777 .
+The service runs as the unprivileged user
+.BR ha-agent ,
+which cannot bind a port below 1024; if a low port is really wanted, give the
+unit
+.B AmbientCapabilities=CAP_NET_BIND_SERVICE
+and a matching
+.BR CapabilityBoundingSet .
+.TP
+.B HOST
+Address to bind. Empty, the default, means
+.B 0.0.0.0
+- all interfaces, IPv4 only, which is why a prober that resolves
+.I localhost
+to
+.B ::1
+comes back refused on that attempt before it falls through to IPv4.
+.B ::
+binds all interfaces of both families with one socket, IPv4 clients arriving as
+v4-mapped addresses, unless the system forces IPv6-only binds
+.RI ( net.ipv6.bindv6only
+set to 1). Any IPv6 address is accepted and the agent listens on the IPv6
+family; a name is resolved by the system resolver in the IPv4 family, so a name
+with only an AAAA record does not bind - write the address, or
+.BR :: .
+.TP
+.B REFRESH_INTERVAL
+Seconds between samples of CPU, i/o wait, memory and the accelerator when it is
+switched on, and between re-reads of
+.IR /etc/ha-agent.status .
+Default
+.BR 7 .
+Neither the percentage nor the state word is fresher than this.
+.TP
+.BR CPU_WEIGHT ", " IOW_WEIGHT ", " MEM_WEIGHT
+Relative weight of each factor in the reported percentage. Counts, not
+fractions: 3 and 1 means the first counts three times what the second counts.
+Default
+.B 1
+for all three, and at least one of them must be positive, because the three are
+averaged by their sum. Raise the one that limits this host.
+.TP
+.BR GPU_WEIGHT
+Weight of the accelerator factor, in the same counts-and-fractions sense as the
+three above. Default
+.BR 0 ,
+which leaves the factor out and opens no
+.I sysfs
+path at all.
+When it is positive, the factor is how much of the recent sampling the busiest
+device in the box was
+.I not
+busy: the maximum across cards of
+.IR /sys/class/drm/card*/device/gpu_busy_percent ,
+which is the figure that device's own firmware computes for its activity level.
+The agent names no vendor, no card and no device node, and reads nothing that
+would need a driver's tool installed.
+
+It is a ballpark for "do not send this new session here", which is what it was
+built for, and not a measurement of the work: a device saturated by one large
+batch and a device busy with forty small requests can report the same number.
+Two limits follow from that and are worth reading before raising it. A host whose
+driver exposes no such attribute has that factor left out of the average and is
+scored on what the agent can see, with one line in the journal at startup saying
+as much; and a device that exposes no percentage at all - an NPU, on the hardware
+these boxes were tested on - is invisible, so it would be reported as idle, and
+on a host that serves its work from one the honest setting is
+.BR 0 .
+.TP
+.B GPU_SAMPLES
+How many readings of that figure are averaged before it is used. Default
+.BR 3 ,
+which at the default
+.I REFRESH_INTERVAL
+is about 21 seconds of history. The reason for averaging rather than answering
+from the newest reading is that the device reports a snapshot of something that
+moves in seconds - it was measured going from 79% to 0% sixteen seconds apart
+while serving inference - and the reply is a weight HAProxy redistributes traffic
+on. A sample that cannot read the device at all clears the window rather than
+smoothing across the gap, so the average is recent truth or nothing.
+.TP
+.B PROC_PREFIX
+Where to read
+.I procfs
+from, default
+.BR /proc .
+Set it when the agent runs in a container with the host's
+.I /proc
+mounted elsewhere, for example
+.IR /host/proc .
+.TP
+.B SYS_PREFIX
+Where to read
+.I sysfs
+from, default
+.BR /sys ,
+opened only for the accelerator factor. Set it when the agent runs in a container
+with the host's
+.I /sys
+mounted elsewhere, for example
+.IR /host/sys .
+.SH FILES
+.TP
+.I /usr/bin/ha-agent
+the program
+.TP
+.I /usr/lib/systemd/system/ha-agent.service
+the unit; enable it with
+.BR "systemctl enable --now ha-agent" .
+It runs the agent as an unprivileged user with the usual sandboxing on - no new
+privileges, private
+.BR /tmp ,
+read-only system directories, restricted address families, namespaces and
+personality. The agent opens nothing for writing, which is what makes that
+list possible.
+.TP
+.I /etc/default/ha-agent
+.I /etc/sysconfig/ha-agent
+configuration, one of the two per host. Packaged as a configuration file, so an
+upgrade keeps the copy on the host.
+.TP
+.I /etc/ha-agent.status
+operator state, read once per
+.BR REFRESH_INTERVAL .
+Its first line is added to the reply, which is how a backend is taken out of
+rotation locally without taking the machine down:
+.IP
+.EX
+echo drain > /etc/ha-agent.status
+.EE
+.IP
+A final newline is not required and blanks around the line are ignored, so a
+file written with
+.BR printf (1)
+or by an editor that adds no newline works as written. Words inside the line are
+sent as they stand, so anything
+.I agent-check
+understands may go there. An empty or missing file means no state word, which
+leaves a state set on HAProxy's side untouched. Also packaged as a configuration
+file, so an upgrade does not reset a drain.
+.SH "SEE ALSO"
+.BR systemd.service (5),
+.BR systemd.exec (5)
+(for the
+.B EnvironmentFile
+syntax used by the configuration files),
+the
+.I agent-check
+section of the HAProxy configuration manual,
+https://github.com/avlis/ha-agent
+.SH AUTHOR
+Bruno Silva <avlis@onurb.com>
+.SH LICENSE
+GNU GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+This is free software: you are free to change and redistribute it.  There is NO
+WARRANTY, to the extent permitted by law.

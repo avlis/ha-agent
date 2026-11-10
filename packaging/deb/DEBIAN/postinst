@@ -1,0 +1,86 @@
+#!/bin/sh
+# postinst for ha-agent
+#
+# Called as: postinst configure [old-version]
+# old-version is empty on a fresh install and set on an upgrade.
+set -e
+
+SERVICE=ha-agent.service
+AGENT_USER=ha-agent
+AGENT_GECOS='HAProxy load agent'
+AGENT_SHELL=/usr/sbin/nologin
+AGENT_HOME=/nonexistent
+
+# The account is created with adduser(8), which picks the uid from the system
+# range in /etc/adduser.conf: no number is written into this script, so the
+# package cannot collide with an allocation the host already made.
+create_user() {
+    if getent group "$AGENT_USER" >/dev/null 2>&1; then
+        adduser --quiet --system --ingroup "$AGENT_USER" \
+                --home "$AGENT_HOME" --no-create-home \
+                --shell "$AGENT_SHELL" --gecos "$AGENT_GECOS" "$AGENT_USER"
+    else
+        adduser --quiet --system --group \
+                --home "$AGENT_HOME" --no-create-home \
+                --shell "$AGENT_SHELL" --gecos "$AGENT_GECOS" "$AGENT_USER"
+    fi
+}
+
+# An existing account is never replaced, which is what makes reinstall and
+# upgrade work: the 2020 postinst called plain "useradd ha-agent", that exits 1
+# once the user exists, and the package was left half-configured (dpkg state
+# "iF") with every later apt run dying on "No file name for ha-agent".
+if getent passwd "$AGENT_USER" >/dev/null 2>&1; then
+    # The 2020 package created this account with plain "useradd", which gave a
+    # service account a login shell, a real home in the passwd record and a uid
+    # from the user range. Bring the account back to system-account shape, but
+    # leave the uid alone (files on the host may already belong to it) and
+    # leave any directory on disk alone too.
+    account_shell=$(getent passwd "$AGENT_USER" | cut -d: -f7)
+    account_home=$(getent passwd "$AGENT_USER" | cut -d: -f6)
+    case $account_shell in
+        */nologin|*/false) ;;
+        *)
+            echo "ha-agent: $AGENT_USER has login shell '$account_shell' (created by the 2020 package); setting it to $AGENT_SHELL." >&2
+            usermod --shell "$AGENT_SHELL" "$AGENT_USER" || true
+            ;;
+    esac
+    case $account_home in
+        "$AGENT_HOME"|/|"") ;;
+        *)
+            echo "ha-agent: $AGENT_USER has home '$account_home' (created by the 2020 package); setting it to $AGENT_HOME. Nothing on disk was moved or removed." >&2
+            usermod --home "$AGENT_HOME" "$AGENT_USER" || true
+            ;;
+    esac
+elif ! create_user; then
+    echo "ha-agent: could not create the system user '$AGENT_USER'." >&2
+    echo "ha-agent: create it by hand, then run: dpkg --configure ha-agent" >&2
+    exit 1
+fi
+
+# Enabling and starting go through the two helpers shipped by the Essential
+# package init-system-helpers. They divide the work: deb-systemd-helper only
+# writes enablement state under /etc/systemd/system, so it does the right thing
+# whether or not systemd is running, and deb-systemd-invoke forwards to
+# systemctl only when systemd is PID 1 and stays silent otherwise. That is what
+# makes image builds, chroots and non-systemd hosts install cleanly. Direct
+# systemctl calls have neither property: they fail, and postinst runs under
+# "set -e".
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper unmask "$SERVICE" >/dev/null || true
+    if [ -z "$2" ] || deb-systemd-helper --quiet was-enabled "$SERVICE"; then
+        deb-systemd-helper enable "$SERVICE" >/dev/null || true
+    fi
+fi
+
+if command -v deb-systemd-invoke >/dev/null 2>&1; then
+    if [ -z "$2" ]; then
+        # Fresh install: start it now.
+        deb-systemd-invoke start "$SERVICE" >/dev/null 2>&1 || true
+    else
+        # Upgrade: restart only if it was already running.
+        deb-systemd-invoke try-restart "$SERVICE" >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

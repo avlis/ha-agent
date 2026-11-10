@@ -1,0 +1,67 @@
+# ha-agent configuration
+#
+# Installed by the deb at /etc/default/ha-agent and by the rpm at
+# /etc/sysconfig/ha-agent; the systemd unit reads both paths, so one file
+# per host is enough. Read as an EnvironmentFile, so: KEY=value only, no
+# shell expansion, no command substitution.
+
+# Every value is an integer. A blank one ("PORT=") means the default and is
+# reported in the journal; one that is not a number, or is outside its range,
+# stops the agent with a line naming it, so the mistake is visible rather than
+# buried in a traceback.
+
+# TCP port HAProxy polls (agent check). Below 1024 the service runs as the
+# unprivileged user ha-agent and cannot bind it; see the man page for
+# AmbientCapabilities=CAP_NET_BIND_SERVICE if a low port is really wanted.
+PORT=7777
+
+# Address to bind. Empty means 0.0.0.0 (all interfaces). An IPv6 address is
+# accepted and the agent then listens on the IPv6 family; a name is resolved.
+# Left unquoted on purpose: an empty value is unambiguous for every reader,
+# while '' depends on the parser stripping quotes.
+HOST=
+
+# Seconds between load samples. The percentage in the reply is only as fresh as
+# this; the drain word from /etc/ha-agent.status is read on the same pass.
+REFRESH_INTERVAL=7
+
+# Relative importance of each factor in the reported weight. Counts, not
+# fractions: 3 and 1 means CPU counts three times what memory counts. At least
+# one of these three must be positive, since they are averaged by their sum;
+# GPU_WEIGHT below adds to them and cannot replace them.
+CPU_WEIGHT=1
+IOW_WEIGHT=1
+MEM_WEIGHT=1
+
+# Accelerator load, for a host whose work is done by a device rather than by the
+# CPU. Default 0, which means the factor is off and no sysfs file is opened at
+# all. When it is positive, the factor is how much of the recent sampling the
+# busiest device in the box was NOT busy - the maximum across cards of
+# /sys/class/drm/card*/device/gpu_busy_percent, the figure the device's own
+# firmware computes for its activity. No vendor tool and no device name is
+# involved; nothing here knows which card this is.
+#
+# It is a ballpark for "do not send this new session there", not a measure of
+# the work itself. Two limits worth knowing: a driver that exposes no such
+# attribute is simply left out of the average, and the agent says that in the
+# journal at startup instead of guessing; and an accelerator that exposes none
+# at all - an NPU, on the hardware these boxes run on - reads idle to this
+# agent, so on a host that serves work from one, leave this at 0.
+GPU_WEIGHT=0
+
+# How many readings of that figure are averaged before it counts. The device
+# number is a snapshot of something that moves in seconds - it was measured
+# going from 79% to 0% in 16 seconds while serving inference - and the reply is
+# a weight HAProxy acts on, so one reading swings traffic. 3 means the last
+# three samples, about 21 seconds at the default REFRESH_INTERVAL. Only read
+# when GPU_WEIGHT is positive.
+GPU_SAMPLES=3
+
+# procfs prefix. Only needs changing when the agent runs in a container with
+# the host's /proc mounted elsewhere (e.g. /host/proc).
+PROC_PREFIX=/proc
+
+# sysfs prefix, opened only for the accelerator factor above. Only needs
+# changing when the agent runs in a container with the host's /sys mounted
+# elsewhere (e.g. /host/sys).
+SYS_PREFIX=/sys

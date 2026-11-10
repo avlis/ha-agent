@@ -1,0 +1,183 @@
+ha-agent (1.3.2-1) unstable; urgency=medium
+
+  * A probe that sends a byte gets its reply. close() on a socket that still
+    has unread data in its receive queue does not send FIN: the kernel sends
+    RST, and a reset aimed at the peer discards the reply bytes already
+    written. Every
+    prober that introduced itself therefore got nothing back on a completely
+    idle machine: echo | nc localhost 7777 measured 30 of 30 resets, with this
+    host's OutRsts counter up 33 over exactly those probes, and a client that
+    sends a byte and then half-closes (nc -N, and most monitors that say who
+    they are) got 0 replies in 600. No load involved, so nothing about the
+    accept queue explained it - and HAProxy's agent-check sends nothing, which
+    is why not one release since 2020 noticed while every check by hand did.
+    The agent now shuts its own half down after the reply, so a reader sees
+    where it ends, and reads back whatever was sent before hanging up. Silent
+    probes still cost one send and one read: 600 probes at 150 concurrent take
+    the same 0.06s they took before, on all three shapes.
+
+ -- Bruno Silva <avlis@onurb.com>  Wed, 11 Nov 2026 10:26:05 +0000
+
+ha-agent (1.3.1-1) unstable; urgency=medium
+
+  * A burst of probes is answered in full. Every accepted connection used to get
+    a thread of its own, in front of a listen backlog of 5, so when arrivals
+    outran thread creation the kernel dropped the connections: measured 465 of
+    2000 probes lost at 300 concurrent, TcpExtListenOverflows up by as much.
+    What the prober got was a connection that was never served, which is
+    nothing back: nc prints an empty line and HAProxy logs an empty agent reply
+    and treats the agent as failed. It depends on how loaded the host is, which
+    is why it read as intermittent and why no test caught it in six years -
+    HAProxy fires every server's agent-check at once on a start and on a reload,
+    and a box doing inference drains the accept queue more slowly. The reply is
+    now written from the accept loop itself, from bytes the sampler publishes
+    once per REFRESH_INTERVAL, so a probe costs one send and nothing about the
+    answer is worked out on a probe's account: same host, same minute, 2000 of
+    2000 answered, at a tenth of the CPU per probe.
+  * A probe is never refused. The cap added in 1.2.0 closed connections without
+    an answer past 32 unanswered responders, which is the very failure this
+    release is about: an empty reply costs whoever probes us more than waiting
+    does, and there is nothing to shed. The listen backlog goes from 5 to 256
+    too, since that queue is where a burst is meant to wait.
+  * An unreadable /proc no longer burns a core. The failed-sample path retried
+    immediately, because the sample sleeps inside itself and the first read is
+    what fails when a prefix is unreadable: a measured 1000 ms of CPU per second
+    for the whole outage. It now waits out the interval, and the lifecycle tests
+    assert both that an outage is cheap and that the numbers come back on their
+    own once the prefix is readable again.
+
+ -- Bruno Silva <avlis@onurb.com>  Wed, 11 Nov 2026 08:48:23 +0000
+
+ha-agent (1.3.0-1) unstable; urgency=medium
+
+  * A fourth factor in the reported weight, for a host whose work is done by an
+    accelerator rather than by the CPU: how much of the recent sampling the
+    busiest device in the box was NOT busy. Off by default (GPU_WEIGHT=0): at 0
+    no sysfs path is opened, so the answer is what CPU and memory say, exactly
+    as before. The figure comes from
+    /sys/class/drm/card*/device/gpu_busy_percent, the number that device's own
+    firmware computes for its activity level, so nothing in the agent names a
+    vendor, a card or a device node and no driver's tool has to be installed.
+    A host serving work from an accelerator and polled on CPU alone looked idle
+    next to a peer with room: with the factor raised, the box that is spent
+    answers low and the new sessions go to the one that is not.
+  * That factor is averaged over GPU_SAMPLES readings, default 3, before it is
+    used. The device reports a snapshot of something that moves in seconds - it
+    was measured going from 79% to 0% sixteen seconds apart while serving
+    inference - and the reply is a weight HAProxy redistributes traffic on, so a
+    single reading swings traffic on every poll. A sample that cannot read the
+    device clears the window instead of smoothing across the gap, so the average
+    is recent truth or nothing.
+  * A host whose driver exposes no such attribute is scored on the factors that
+    did answer: the missing one leaves the divisor, so the rest keep their
+    proportions. It is not counted as idle, which would give a machine more
+    traffic for a device it does not have, and the startup journal says what the
+    agent could not see rather than leaving that to be guessed. A device that
+    exposes no percentage anywhere - an NPU, on the hardware these boxes were
+    tested on - is invisible to it and reads idle, so the manual page says
+    plainly that the honest setting on such a host is 0.
+  * GPU_WEIGHT, GPU_SAMPLES and SYS_PREFIX in the configuration file, the manual
+    page and README, checked against the names in the program in both directions
+    by the lifecycle tests, as the other variables are.
+
+ -- Bruno Silva <avlis@onurb.com>  Tue, 10 Nov 2026 19:17:17 +0000
+
+ha-agent (1.2.0-1) unstable; urgency=medium
+
+  * The reply no longer loses its last character. The state file was read with
+    its final byte chopped off on the assumption that it was a newline, so a
+    file written by printf, by echo -n, or by an editor that adds no final
+    newline sent "drain" as "drai" - and HAProxy matches that word exactly, so
+    the drained backend went on taking traffic while the operator believed it
+    was out of rotation. Line endings and surrounding blanks are stripped now.
+  * A value that is set but empty means the default instead of a crash. systemd
+    sets "PORT=" in the environment to the empty string and os.getenv hands that
+    back rather than the default, so disabling a value in the configuration file
+    stopped the agent with a ValueError; the fallback is logged. A value that is
+    present but not a number, or outside its range, now stops the agent with one
+    line naming it. The three weights are counts, so 0.5 is refused, and all
+    three being 0 is refused rather than dividing by their sum later.
+  * A sample that cannot be taken no longer takes the sampling thread down with
+    it. It died quietly and the agent served, for the rest of its life, the last
+    number it had ever computed - HAProxy balancing on a figure from some moment
+    in the past and never told. The percentage is now simply left out of the
+    reply, which HAProxy reads as having no opinion about weight and so keeps
+    the one configured; the drain word is still honoured, because the state file
+    is read outside the part that can fail; and the reason is logged once and
+    not once per interval. Covered: unreadable or unexpected procfs, MemTotal 0,
+    missing MemAvailable, two identical cpu samples.
+  * The reply is never empty, including the first REFRESH_INTERVAL seconds after
+    a start when no sample exists yet. An empty reply is an agent-check failure,
+    and with the HAProxy defaults a restart of the agent could put the server
+    out of rotation before the first sample landed.
+  * Errors a listening socket raises because of other people's behaviour are
+    retried: ECONNABORTED from a client that reset before accept, EMFILE/ENFILE,
+    ENOBUFS, EINTR. They used to reach the same handler as a fatal error and end
+    the process. A bind failure now names its cause - address in use, port below
+    1024 while running as ha-agent, address this host does not have.
+  * HOST accepts an IPv6 address and the socket is created for its family;
+    passing one to an AF_INET socket failed at startup and took the service with
+    it. Empty still means 0.0.0.0.
+  * At most 32 probes are answered at the same time; past that a connection is
+    closed without an answer, which is an honest agent failure, and writing the
+    reply no longer holds the lock that the sampler needs.
+  * The unit sandboxes the agent: NoNewPrivileges, PrivateTmp, ProtectSystem,
+    read-only kernel views, restricted address families, namespaces, setuid and
+    personality. It reads /proc, one file under /etc and a socket, and writes
+    nothing, so this is the shape it already had, now written down.
+  * ha-agent(1) and README say what the percentage is to HAProxy: a weight, as a
+    share of the one configured for the server, where a larger number means more
+    traffic and 0% acts as a drain. Both called it a load estimate, which reads
+    as the reverse of what the number does.
+
+ -- Bruno Silva <avlis@onurb.com>  Tue, 10 Nov 2026 12:00:00 +0000
+
+ha-agent (1.1.0-1) unstable; urgency=medium
+
+  * Move the program from /usr/local/bin/ha-agent.py to /usr/bin/ha-agent with
+    a python3 shebang. A package installs under /usr; /usr/local is the
+    hierarchy the system administrator owns and the Filesystem Hierarchy
+    Standard reserves for exactly that. lintian treats a package writing there
+    as an error. The previous package owned the old path, so the upgrade takes
+    that file with it; dpkg may then note that /usr/local is not empty and leave
+    the directory, which is correct - it is not the package's directory.
+  * One unit file for both families: the agent's options are read from
+    EnvironmentFile=-/etc/default/ha-agent and
+    EnvironmentFile=-/etc/sysconfig/ha-agent. The 2020 .deb pointed at the
+    first and the 2020 .rpm at the second, so no single unit worked on both,
+    and a missing file aborted the start instead of being skipped.
+  * Service account maintained with adduser(8)/usermod(8) rather than plain
+    useradd: the uid comes from the system range instead of being whatever the
+    default allocator handed out, and an account left by the 2020 package
+    (login shell, home directory in the user range) is corrected in place. The
+    uid and any files on disk are never rewritten.
+  * Maintainer scripts drive systemd through deb-systemd-helper and
+    deb-systemd-invoke. Installing into a chroot, an image build or a host
+    without systemd no longer leaves the package half-configured, which is what
+    plain "systemctl" calls in the 2020 postinst did (dpkg state "iF", and
+    every later apt run failing with "No file name for ha-agent").
+  * /etc/default/ha-agent and /etc/ha-agent.status are declared conffiles, so
+    an upgrade keeps the local configuration and a drain state instead of
+    silently resetting both.
+  * StartLimitIntervalSec/StartLimitBurst moved to [Unit], where systemd reads
+    them; added Group, SyslogIdentifier and dropped the redundant ExecStop.
+  * The prebuilt .deb and .rpm are removed from the repository. They were built
+    by hand, could not be reproduced, and a copy of the .deb that circulated was
+    an HTML page saved from GitHub's file view, which apt rejects with "Invalid
+    archive signature". Packages are now built from source by ./package.sh into
+    dist/, which is gitignored.
+  * A manual page, ha-agent(1), covering the environment variables and the
+    drain file, replacing the drift-prone list in README.md.
+  * Package metadata corrected: Section admin (was "custom"), real
+    Installed-Size (was a hardcoded 1024), a DEP-5 copyright file and this
+    changelog.
+
+ -- Bruno Silva <avlis@onurb.com>  Tue, 10 Nov 2026 00:00:00 +0000
+
+ha-agent (1.0.0-1) unstable; urgency=low
+
+  * First release. Agent for HAProxy's agent check: answers each probe with a
+    load figure weighted across CPU, i/o wait and available memory, plus the
+    first line of /etc/ha-agent.status so a backend can be drained locally.
+
+ -- Bruno Silva <avlis@onurb.com>  Fri, 11 Dec 2020 00:00:00 +0000

@@ -1,0 +1,613 @@
+# Agent behaviour, shared by the two lifecycle tests. Not a test on its own:
+# package.sh runs packaging/tests/*.sh and this file is deliberately not one.
+#
+# Everything here is about the program rather than the packaging, so it runs
+# twice - once in debian, once in almalinux - against the installed
+# /usr/bin/ha-agent, started as the ha-agent account the way the unit starts it:
+# configuration through the environment, diagnostics on stderr.
+#
+# Neither container runs systemd as pid 1, on purpose: the packages have to
+# install and erase in a chroot and an image build too, which is the bug the
+# 2020 postinst had. So these checks start the program directly instead of
+# asking a service manager, and read its stderr instead of the journal.
+#
+# Requires from the caller: $fail, and either $CONF (this family's configuration
+# file) for agent_config_probe or nothing at all for agent_behaviour.
+
+agent_knobs() {  # the knob names the installed program actually reads
+    # Both spellings: env_int() takes the name for os.getenv(), so grepping for
+    # getenv() alone finds two names out of seven and checks almost nothing.
+    grep -oE "(env_int|getenv)\('[A-Z_]+'" /usr/bin/ha-agent \
+        | sed -E "s/.*'([A-Z_]+)'/\1/" | sort -u
+}
+
+agent_probe() {  # port (default 7777) -> the reply as HAProxy would read it
+    python3 - "${1:-7777}" <<'PY'
+import socket, sys
+try:
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+    raw = s.recv(4096).decode(errors="replace")
+    # HAProxy stops reading at the first \r or \n and matches words exactly.
+    print(raw.split("\r", 1)[0].split("\n", 1)[0].strip())
+except Exception as exc:
+    print("<no answer: %s>" % exc)
+PY
+}
+
+# Words on one line, so `case " $(agent_words) " in *" drain "*` matches a word
+# exactly and not as the tail of another one. Newlines have to be folded too:
+# command substitution keeps the ones inside the text, and a newline is not a
+# space to a case pattern.
+agent_words() { agent_probe "${1:-7777}" | tr -s ' \t,\n' ' '; }
+
+agent_start() {  # $1 name, rest VAR=value (an empty value is passed as empty)
+    name=$1; shift
+    alog=/tmp/agent-$name.log
+    apid=/tmp/agent-$name.pid
+    rm -f "$alog" "$apid"
+    su -s /bin/sh ha-agent -c "env $* nohup /usr/bin/ha-agent >$alog 2>&1 & echo \$! > $apid"
+    sleep 1
+    agent_pid=$(cat "$apid" 2>/dev/null || echo '')
+    [ -n "$agent_pid" ] || fail "$name: no pid for the agent"
+}
+
+agent_alive() { kill -0 "$agent_pid" 2>/dev/null; }
+
+# Who else in this container is an ha-agent, read out of /proc because neither
+# image is promised `ps` or `ss`. A start that could not bind needs this named:
+# the port being taken is usually a case that stopped an agent that did not die.
+agent_strays() {
+    for dir in /proc/[0-9]*; do
+        cmd=$(tr '\0' ' ' < "$dir/cmdline" 2>/dev/null) || continue
+        case $cmd in
+            *ha-agent*) echo "   ${dir#/proc/}: $cmd" ;;
+        esac
+    done
+}
+
+agent_stop() {
+    # `|| true`: the final command of an && list is the one `set -e` watches, and
+    # killing a pid that already exited - which is what a case that expects the
+    # agent to refuse and leave has on its hands - is exactly that.
+    if [ -n "${agent_pid:-}" ]; then
+        kill "$agent_pid" 2>/dev/null || true
+    fi
+    sleep 1
+    agent_pid=''
+}
+
+agent_log() { cat "${alog:-/dev/null}" 2>/dev/null || true; }
+
+agent_wait_sample() {  # block until the reply carries a percentage
+    for _ in $(seq 1 20); do
+        agent_probe "${1:-7777}" | grep -q '[0-9]%' && return 0
+        sleep 1
+    done
+    return 1
+}
+
+agent_behaviour() {
+    # A short interval keeps the run quick; the state file is read once per pass,
+    # so every check that changes it waits one pass.
+    INT=2
+
+    echo "--- the reply is never empty, not even before the first sample"
+    : > /etc/ha-agent.status                     # no state, and nothing measured
+    agent_start empty "PROC_PREFIX=/proc" "REFRESH_INTERVAL=$INT" "PORT=8801"
+    reply=$(agent_probe 8801)
+    [ -n "$reply" ] || fail "empty reply in the first seconds after a start. An
+    empty reply is an agent-check failure: with the HAProxy defaults a restart
+    would put the server out of rotation before the first sample landed."
+    echo "   reply with nothing known: '$reply'"
+    echo "$reply" | grep -q '%' && fail "a percentage before any sample: $reply"
+
+    echo "--- a sample brings the percentage, and an empty state file adds nothing"
+    agent_wait_sample 8801 || fail "no percentage after $INT seconds: $(agent_probe 8801)
+    log: $(agent_log)"
+    reply=$(agent_probe 8801)
+    echo "$reply" | grep -qE '^[0-9]+%$' || fail "reply is a bare percentage with no state file: '$reply'"
+    echo "   reply with a sample: $reply"
+
+    echo "--- the drain word survives a file with no final newline"
+    printf 'drain' > /etc/ha-agent.status        # printf, echo -n, an editor
+    sleep $((INT + 2))
+    case " $(agent_words 8801) " in
+        *" drain "*) echo "   reply: $(agent_probe 8801)" ;;
+        *) fail "the state word is not 'drain' (reply '$(agent_probe 8801)').
+    Chopping the last byte turns 'drain' into 'drai', and HAProxy matches the
+    word exactly, so a drained backend would keep taking traffic." ;;
+    esac
+
+    echo "--- blanks around the state line are not part of the word"
+    printf '   maint   \n' > /etc/ha-agent.status
+    sleep $((INT + 2))
+    case " $(agent_words 8801) " in
+        *" maint "*) echo "   reply: $(agent_probe 8801)" ;;
+        *) fail "the state word is not 'maint' (reply '$(agent_probe 8801)')" ;;
+    esac
+
+    echo "--- an unreadable procfs costs the percentage and nothing else"
+    # The thread that could not sample used to die, and every reply after it
+    # repeated the last number it had ever computed, for the rest of the run.
+    agent_stop
+    printf 'drain\n' > /etc/ha-agent.status
+    agent_start broken "PROC_PREFIX=/nonexistent" "REFRESH_INTERVAL=1" "PORT=8802"
+    sleep 6
+    agent_alive || fail "the agent stopped when procfs could not be read:
+$(agent_log)"
+    reply=$(agent_probe 8802)
+    [ -n "$reply" ] || fail "empty reply with an unreadable procfs"
+    case "$reply" in *%*) fail "a percentage is still being reported with no procfs: $reply" ;; esac
+    case " $(agent_words 8802) " in
+        *" drain "*) echo "   reply with no sample: $reply" ;;
+        *) fail "the drain word went away with the percentage: '$reply'" ;;
+    esac
+    agent_log | grep -q 'no load sample' || fail "nothing in the output says why there is no percentage:
+$(agent_log)"
+    sleep 20
+    count=$(agent_log | grep -c 'no load sample' || true)
+    [ "$count" -le 2 ] || fail "the same failure is logged $count times in ~26s; it is one outage, and HAProxy polls on every interval"
+    echo "   one line for the outage, not one per interval ($count)"
+
+    # And it must be a *waiting* wait. The sample sleeps inside itself, so a
+    # failure before that sleep retried immediately, forever: a measured 1000 ms
+    # of CPU per second for as long as the outage lasted. One core burned by an
+    # agent that had nothing to say, on the machines whose cores this weight
+    # exists to keep free. The budget is loose (a whole second of CPU in five)
+    # because it must not go red on a loaded builder; the bug was 5x over it.
+    before=$(agent_cpu_ms "$agent_pid")
+    sleep 5
+    spent=$(( $(agent_cpu_ms "$agent_pid") - before ))
+    [ "$spent" -lt 1000 ] || fail "an unreadable procfs burned ${spent}ms of CPU in 5s (REFRESH_INTERVAL=1): an outage has to cost the percentage and nothing else"
+    echo "   ${spent}ms of CPU in 5s of outage, and no retry storm"
+    agent_stop
+
+    echo "--- sampling comes back when procfs becomes readable"
+    # The other half: the outage above is over for good in this run, so a prefix
+    # that fills in has to start producing numbers again on its own. The files
+    # are copied under a name and renamed into place, the way a real /proc keeps
+    # changing under a reader, and copied again each second because a snapshot
+    # that never advances is not a load sample - it is a ValueError.
+    rdir=/tmp/fakeproc-recover
+    rm -rf "$rdir"; mkdir -p "$rdir"; chmod a+rX "$rdir"
+    agent_start recover "PROC_PREFIX=$rdir" "REFRESH_INTERVAL=1" "PORT=8807"
+    sleep 3
+    agent_log | grep -q 'no load sample' \
+        || fail "an empty proc prefix was not reported as an outage: $(agent_log)"
+    i=0
+    while [ "$i" -lt 25 ]; do
+        i=$((i + 1))
+        for f in stat meminfo; do
+            cp /proc/$f "$rdir/$f.new" 2>/dev/null && mv -f "$rdir/$f.new" "$rdir/$f"
+        done
+        sleep 1
+    done &
+    copier=$!
+    agent_wait_sample 8807 || fail "procfs became readable and the percentage never came back: '$(agent_probe 8807)'
+$(agent_log)"
+    kill "$copier" 2>/dev/null
+    echo "   percentage back on its own: $(agent_probe 8807)"
+    agent_stop
+
+    echo "--- an empty value means the default, not a crash"
+    # systemd's EnvironmentFile exports "PORT=" to the empty string and
+    # os.getenv hands that back rather than the default, so blanking a line
+    # stopped the service at startup.
+    #
+    # The default port is 7777, so this can only *listen* there if nothing else
+    # does. Rootless podman on a host with no /dev/net/tun cannot give a container
+    # its own network, so the container shares the machine's - and on a machine
+    # that already runs ha-agent, which is exactly where these packages get
+    # built, 7777 is taken and the agent exits on the bind. That is not something
+    # the package did: the fallback is still proved (it is logged before the
+    # bind happens), and only the probe is skipped, out loud, never as a pass.
+    port_taken=0
+    python3 - <<'PY' 2>/dev/null || port_taken=1
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("0.0.0.0", 7777))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+    agent_start blank "PORT=" "REFRESH_INTERVAL=" "PROC_PREFIX=/proc"
+    if [ "$port_taken" -eq 0 ]; then
+        agent_alive || fail "the agent did not come up on defaults after empty values:
+$(agent_log)
+processes in this container holding ha-agent:
+$(agent_strays)"
+        # REFRESH_INTERVAL is empty too, so the packaged default (7s) applies
+        # here; wait for a sample instead of guessing how long to sleep.
+        agent_wait_sample 7777 || fail "empty PORT left the agent up but not answering a weight on 7777
+$(agent_log)"
+        reply=$(agent_probe 7777)
+        agent_log | grep -q 'PORT is set but empty' || fail "the fallback was not reported: $(agent_log)"
+        echo "   $reply  ($(agent_log | grep 'set but empty' | head -1 | sed 's/^ha-agent: //'))"
+    else
+        sleep 2
+        agent_log | grep -q 'PORT is set but empty' || fail "the fallback was not reported: $(agent_log)"
+        agent_log | grep -q 'REFRESH_INTERVAL is set but empty' \
+            || fail "the fallback was not reported: $(agent_log)"
+        echo "   fell back to the documented defaults, and said so"
+        echo "   SKIPPED the probe on 7777: something outside this container holds"
+        echo "   that port (no /dev/net/tun, so podman gave the container the" 
+        echo "   host's network), which is where an installed ha-agent answers."
+        echo "   The reply on the default port was NOT checked in this run."
+    fi
+    agent_stop
+
+    echo "--- a value that is not a number stops the agent, naming it"
+    for bad in 'PORT=abc' 'PORT=0' 'PORT=70000' 'REFRESH_INTERVAL=0' 'CPU_WEIGHT=0.5' \
+               'GPU_WEIGHT=-1' 'GPU_SAMPLES=0'; do
+        # $bad last: env takes the last assignment, and the point is that this
+        # value is the one the agent objects to.
+        agent_start "bad${bad%%=*}" "PROC_PREFIX=/proc" "$bad"
+        sleep 2
+        if agent_alive; then
+            fail "$bad left the agent running"
+        fi
+        line=$(agent_log | tail -1)
+        case $line in
+            *"${bad%%=*}"*) echo "   $bad -> $line" ;;
+            *) fail "$bad did not name the value it rejected: '$line'" ;;
+        esac
+    done
+    # All three weights zero: they are averaged by their sum.
+    agent_start zero 'CPU_WEIGHT=0' 'IOW_WEIGHT=0' 'MEM_WEIGHT=0' 'PROC_PREFIX=/proc' 'PORT=8804'
+    sleep 2
+    agent_alive && fail "all three weights zero left the agent running"
+    echo "   all weights zero -> $(agent_log | tail -1)"
+
+    echo "--- a burst of probes is answered in full, however they arrive"
+    # Sequential probes are the easy case and this test used to be only that,
+    # which is how a bug that dropped a fifth of a burst survived every release
+    # since 2020: the accept loop started a thread per probe in front of a
+    # backlog of 5, and when arrivals outran thread creation the kernel dropped
+    # the connections - nothing back for the prober, which `nc` shows as an empty
+    # reply and HAProxy logs as an agent failure (measured on a loaded host:
+    # 2000 probes at 300 concurrent lost 400, TcpExtListenOverflows moved by
+    # exactly as much). HAProxy fires the agent-check of every server at once on
+    # a start and on a reload, so a burst is not exotic; and on a box doing
+    # inference the loop drains slower, which is why it reads as intermittent.
+    printf 'ready\n' > /etc/ha-agent.status
+    agent_start burst "PROC_PREFIX=/proc" "REFRESH_INTERVAL=1" "PORT=8805"
+    agent_wait_sample 8805 || fail "no sample on the burst run: $(agent_log)"
+    if ! out=$(python3 - 8805 <<'PY'
+import socket, sys, threading
+
+
+def wave(port, total, concurrency, rounds):
+    lost, empty, bad = 0, 0, 0
+    for _ in range(rounds):
+        box = [None] * total
+
+        def prober(slot):
+            for i in range(slot, total, concurrency):
+                try:
+                    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+                    data = s.recv(200)
+                    s.close()
+                    box[i] = data
+                except Exception as exc:
+                    box[i] = exc
+
+        threads = [threading.Thread(target=prober, args=(k,))
+                   for k in range(concurrency)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for item in box:
+            if isinstance(item, Exception):
+                lost += 1
+            elif not item:
+                empty += 1
+            elif b"%" not in item:
+                bad += 1
+    print("%d probes, %d concurrent: %d never answered, %d empty, %d without a "
+          "percentage" % (total * rounds, concurrency, lost, empty, bad))
+    return lost + empty + bad
+
+
+raise SystemExit(1 if wave(int(sys.argv[1]), 1000, 250, 4) else 0)
+PY
+    ); then
+        fail "a burst of probes was not answered in full: $out
+The reply path must answer every connection it accepts, inline, from the reply
+the sampler left on record - no cap that closes a probe without an answer, and
+nothing per probe that could cost more than a send.
+$(agent_log)"
+    fi
+    echo "   $out"
+    agent_alive || fail "the agent died under the burst"
+    agent_wait_sample 8805 || fail "the agent stopped answering properly after the burst"
+
+    # In order, one after the other: still the shape a single HAProxy uses, and
+    # the one that never failed even when the bug was live. Kept because it is
+    # the control for the wave above - if both fail, the agent is not up.
+    if ! out=$(python3 - 8805 <<'PY'
+import socket, sys
+ok = 0
+for _ in range(60):
+    try:
+        s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+        if s.recv(200):
+            ok += 1
+        s.close()
+    except OSError:
+        pass
+print("%d/60 sequential probes answered" % ok)
+raise SystemExit(0 if ok == 60 else 1)
+PY
+    ); then
+        fail "sequential probes went unanswered: $out"
+    fi
+    echo "   $out"
+
+    # Everything above sends nothing and reads, which is what HAProxy's
+    # agent-check does - and that is why a second way of losing the reply lasted
+    # just as long. close() on a socket with unread data in its receive queue
+    # sends RST, not FIN, and an RST thrown at the peer discards the reply bytes
+    # already written: a hand check (`echo | nc localhost 7777`) came back empty
+    # on an idle machine, 30 of 30, with this host's OutRsts counter up by 33
+    # over exactly those probes, and a prober that half-closes after its byte
+    # (`nc -N`) got 0 replies in 600. Load played no part in it, which is what
+    # made it look unfixable. So: answer, half-close our own side so the reader
+    # sees where the reply ends, and read back whatever it sent before hanging
+    # up. Silent probes must stay as quick as they were, so this is timed.
+    if ! out=$(python3 - 8805 <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+shapes = ("sends nothing", "sends a byte", "sends and halves")
+bad = 0
+for shape in shapes:
+    lost = 0
+    worst = ""
+    for _ in range(40):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            if shape != "sends nothing":
+                s.sendall(b"check\n")
+            if shape == "sends and halves":
+                s.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = s.recv(200)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            if b"%" not in data:
+                lost += 1
+                worst = "no reply" if not data else repr(data)[:40]
+        except OSError as exc:
+            lost += 1
+            worst = type(exc).__name__
+    print("%-16s 40 probes: %d came back without a percentage%s"
+          % (shape, lost, "" if not lost else " (first: %s)" % worst))
+    bad += lost
+raise SystemExit(1 if bad else 0)
+PY
+    ); then
+        fail "a probe that sends something did not get the reply back:$out
+Whatever the prober sent has to be read before close(), or the kernel answers it
+with RST and takes the reply with it; and the reply has to be followed by a FIN
+from us, which is what lets a reader that sends and halves see an end at all.
+$(agent_log)"
+    fi
+    echo "$out" | sed 's/^/   /'
+    agent_stop
+
+    : > /etc/ha-agent.status
+}
+
+agent_pct() { agent_probe "${1:-7777}" | sed -n 's/^\([0-9]\{1,3\}\)%.*/\1/p'; }
+
+# How many ticks of CPU the agent's whole process has used, summed over its
+# threads. The `sub` drops up to the ') ' so a command name holding a space
+# cannot shift the columns.
+agent_cpu_ms() {  # pid -> milliseconds of user+system time
+    total=0
+    for task in /proc/$1/task/*; do
+        [ -r "$task/stat" ] || continue
+        ticks=$(awk '{ sub(/^.*\) /, ""); print ($12 + $13) * 10 }' "$task/stat")
+        total=$(( total + ${ticks:-0} ))
+    done
+    echo "$total"
+}
+
+# What the memory factor alone answers, which is what the agent should answer
+# whenever CPU_WEIGHT, IOW_WEIGHT and GPU_WEIGHT are all 0. Read straight from
+# the same file the agent reads, so a case can say "this is the number with that
+# factor left out" without running a second agent and hoping the host did not
+# move in between. A few points of slack, because it is read a moment apart.
+mem_headroom_pct() {
+    awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "%d", a*100/t}' /proc/meminfo
+}
+
+gap_to() {  # a b -> |a-b|
+    [ "$1" -ge "$2" ] && echo $(( $1 - $2 )) || echo $(( $2 - $1 ))
+}
+
+# A tree the agent can be pointed at with SYS_PREFIX, since neither container has
+# an accelerator and the one attribute this reads cannot be conjured on the host
+# the test runs on. Same trick as PROC_PREFIX=/nonexistent above: the fake is a
+# directory, so nothing here needs a device, root or a vendor's tool.
+fake_sys() {  # name busy-values... -> the SYS_PREFIX to point at
+    name=$1; shift
+    root=/tmp/fakesys-$name
+    rm -rf "$root"
+    mkdir -p "$root/class/drm"
+    i=0
+    for value in "$@"; do
+        card="$root/class/drm/card$i/device"
+        mkdir -p "$card"
+        [ "$value" = none ] || echo "$value" > "$card/gpu_busy_percent"
+        i=$((i + 1))
+    done
+    # The agent runs as the ha-agent account, as the unit starts it.
+    chmod -R a+rX /tmp/fakesys-$name
+    echo "$root"
+}
+
+agent_gpu_factor() {
+    # The accelerator factor, with the CPU and memory factors turned off and the
+    # device's weight set to 20 so the answer is dominated by what the fake tree
+    # says. MEM_WEIGHT stays positive because the three that are always there
+    # have to sum to something: GPU_WEIGHT adds a factor, it is not a base.
+    #
+    # With MEM=m and GPU=20 the arithmetic is (m + 20*headroom) / 21, so the
+    # expected zones are far apart and do not depend on the host's memory: idle
+    # device ~96%, saturated ~0-4%, one of two cards at 80% ~19%.
+    INT=1
+
+    echo "--- GPU_WEIGHT=0 answers exactly what it did before the factor existed"
+    baseline_sys=$(fake_sys off 0)
+    agent_start gpu-off "PROC_PREFIX=/proc" "SYS_PREFIX=$baseline_sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=0" "PORT=8810"
+    agent_wait_sample 8810 || fail "no percentage with the factor off: $(agent_log)"
+    off=$(agent_pct 8810)
+    ref=$(mem_headroom_pct)
+    gap=$(gap_to "$off" "$ref")
+    [ "$gap" -le 8 ] || fail "with the factor off the answer is ${off}% and memory alone says
+    ${ref}%: at GPU_WEIGHT=0 the agent must answer what it answered before this factor existed"
+    if agent_log | grep -qi 'accelerator'; then
+        fail "GPU_WEIGHT=0 and the factor is still being talked about: $(agent_log)"
+    fi
+    agent_stop
+
+    echo "--- an idle device does not hold the answer down, a busy one does"
+    sys=$(fake_sys idle 0)
+    agent_start gpu-idle "PROC_PREFIX=/proc" "SYS_PREFIX=$sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=20" "PORT=8811"
+    agent_wait_sample 8811 || fail "no percentage with an idle device: $(agent_log)"
+    idle=$(agent_pct 8811)
+    agent_log | grep -q 'accelerator factor: weight 20' \
+        || fail "the agent did not say what the accelerator factor is doing: $(agent_log)"
+    agent_stop
+    [ "$idle" -ge 70 ] || fail "a host whose device reports itself idle answers ${idle}%;
+    the factor is meant to hold nothing back when the device is free"
+
+    sys=$(fake_sys busy 100)
+    agent_start gpu-busy "PROC_PREFIX=/proc" "SYS_PREFIX=$sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=20" "PORT=8812"
+    agent_wait_sample 8812 || fail "no percentage with a busy device: $(agent_log)"
+    busy=$(agent_pct 8812)
+    agent_stop
+    [ "$busy" -le 15 ] || fail "a host whose device is saturated answers ${busy}%;
+    the point of the factor is that new sessions go to the peer instead"
+    echo "   same box, device idle -> ${idle}%, device saturated -> ${busy}% (factor off: ${off}%, memory alone: ${ref}%)"
+
+    echo "--- the busiest card decides, not the average of them"
+    sys=$(fake_sys two 20 80)
+    agent_start gpu-two "PROC_PREFIX=/proc" "SYS_PREFIX=$sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=20" "PORT=8813"
+    agent_wait_sample 8813 || fail "no percentage with two cards: $(agent_log)"
+    two=$(agent_pct 8813)
+    agent_stop
+    # Averaging the two cards would answer roughly twice this; a box with one
+    # saturated device has no room whatever the others are doing.
+    [ "$two" -le 35 ] || fail "with cards at 20% and 80% the answer is ${two}%, which is the
+    average of the two and not the busiest one"
+    echo "   cards at 20% and 80% -> ${two}%"
+
+    echo "--- no attribute anywhere: scored on what it can see, and it says so"
+    # This is the case that must not be a zero: a device the host does not have
+    # would count as idle and hand this box more traffic for hardware it lacks.
+    sys=$(fake_sys nothing none)
+    agent_start gpu-none "PROC_PREFIX=/proc" "SYS_PREFIX=$sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=20" "PORT=8814"
+    agent_wait_sample 8814 || fail "the percentage went missing with no attribute to read:
+$(agent_log)"
+    none=$(agent_pct 8814)
+    ref=$(mem_headroom_pct)
+    agent_alive || fail "the agent stopped with GPU_WEIGHT raised on a host without the attribute"
+    agent_log | grep -q 'reports no gpu_busy_percent' \
+        || fail "nothing in the journal says the factor cannot be measured here: $(agent_log)"
+    agent_stop
+    gap=$(gap_to "$none" "$ref")
+    [ "$gap" -le 8 ] || fail "with nothing to read the answer is ${none}% while memory alone says
+    ${ref}%: a factor that cannot be measured has to leave the divisor, not be scored as
+    idle (which would win traffic for hardware this host lacks) or as absent memory."
+
+    echo "--- a device that reports nonsense costs that device and nothing else"
+    # An earlier revision cleared the smoothing window with a slice deletion a
+    # deque does not support, so the whole sample raised and the reply lost its
+    # percentage for the rest of the run: one unreadable card took the weight.
+    sys=$(fake_sys junk notapercentage)
+    agent_start gpu-junk "PROC_PREFIX=/proc" "SYS_PREFIX=$sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=20" "PORT=8815"
+    sleep $((INT * 3 + 2))
+    agent_alive || fail "the agent died over a gpu_busy_percent holding 'notapercentage':
+$(agent_log)"
+    reply=$(agent_probe 8815)
+    echo "$reply" | grep -q '%' || fail "one unreadable device cost the whole percentage: '$reply'
+$(agent_log)"
+    agent_log | grep -q 'not a percentage' \
+        || fail "the junk value was ignored silently, with nothing naming the file: $(agent_log)"
+    echo "   reply with a junk attribute: $reply"
+    agent_stop
+
+    echo "--- a device that disappears mid-run does not freeze an old figure"
+    sys=$(fake_sys vanish 0)
+    agent_start gpu-vanish "PROC_PREFIX=/proc" "SYS_PREFIX=$sys" \
+        "REFRESH_INTERVAL=$INT" "CPU_WEIGHT=0" "IOW_WEIGHT=0" "MEM_WEIGHT=1" \
+        "GPU_WEIGHT=20" "PORT=8816"
+    agent_wait_sample 8816 || fail "no percentage before the device went: $(agent_log)"
+    rm -f "$sys"/class/drm/card0/device/gpu_busy_percent
+    sleep $((INT * 3 + 2))
+    agent_alive || fail "the agent died when the attribute disappeared: $(agent_log)"
+    reply=$(agent_probe 8816)
+    echo "$reply" | grep -q '%' || fail "the percentage disappeared with the device: '$reply'"
+    agent_log | grep -q 'without that factor' \
+        || fail "nothing says the factor stopped being measurable: $(agent_log)"
+    agent_stop
+    : > /etc/ha-agent.status
+}
+
+agent_config_probe() {  # the configuration file this family ships, as the unit reads it
+    [ -n "${CONF:-}" ] || return 0
+    echo "--- the knobs in $CONF are the ones the program reads"
+    names=$(agent_knobs)
+    [ -n "$names" ] || fail "no knob name in /usr/bin/ha-agent: that is not the program this package installs"
+    for name in $names; do
+        grep -q "^$name=" "$CONF" || fail "$name is read by the program but not in $CONF"
+    done
+    # The other direction, because that is the drift nobody notices: a knob in
+    # the shipped file that the code stopped reading, which an operator sets in
+    # the belief it does something.
+    for line in $(grep -oE '^[A-Z_]+=' "$CONF" | tr -d '='); do
+        echo "$names" | grep -qx "$line" || fail "$CONF offers $line, which the program does not read"
+    done
+    echo "   $(echo "$names" | wc -l) knobs, in the file and in the code: $(echo $names)"
+
+    # The callers edit this file before calling (a moved port, a drain state), so
+    # starting from its contents also checks that what an operator wrote there
+    # reaches the program - which is the whole job of the unit's EnvironmentFile.
+    echo "--- and the values in it are the values the agent uses"
+    set -a; . "$CONF"; set +a
+    conf_port=${PORT:-7777}
+    agent_start conf "PROC_PREFIX=${PROC_PREFIX:-/proc}" "REFRESH_INTERVAL=${REFRESH_INTERVAL:-2}" "PORT=$conf_port"
+    agent_alive || fail "the agent would not start from $CONF:
+$(agent_log)"
+    # Wait out whatever interval the file asks for; a fixed sleep only passes
+    # when the packaged default happens to be small.
+    agent_wait_sample "$conf_port" || fail "no percentage when started from $CONF on port $conf_port:
+$(agent_log)"
+    reply=$(agent_probe "$conf_port")
+    case $reply in
+        *%*) echo "   $CONF gives port $conf_port, reply: $reply" ;;
+        *) fail "no percentage when started from $CONF on port $conf_port: '$reply'" ;;
+    esac
+    agent_stop
+}

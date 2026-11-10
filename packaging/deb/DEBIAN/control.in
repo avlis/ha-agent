@@ -1,0 +1,29 @@
+Package: ha-agent
+Version: @VERSION@-@RELEASE@
+Architecture: all
+Section: admin
+Priority: optional
+Maintainer: Bruno Silva <avlis@onurb.com>
+Homepage: https://github.com/avlis/ha-agent
+Depends: python3, adduser
+Suggests: systemd
+Installed-Size: @INSTALLED_SIZE@
+Description: HAProxy agent reporting backend weight and maintenance state
+ Small agent for HAProxy's agent check on Linux backends. Each probe is
+ answered with a weight percentage computed from CPU headroom, i/o wait and
+ available memory, each factor individually weighted: HAProxy reads the
+ number as a share of the weight configured for that server, so a larger
+ number means more traffic and 0% acts as a drain. For instance i/o wait
+ matters more on a database server than memory usage does, which is what
+ the per-factor weights are for.
+ .
+ Sampling runs on its own thread, separate from the thread that answers
+ HAProxy, so a backend can be polled by several HAProxy instances without
+ the polling itself showing up as load. When no sample can be taken the
+ percentage is left out of the reply, so HAProxy keeps the weight it was
+ given instead of following a number the agent can no longer support, and
+ the reply is never empty, because an empty reply is an agent failure.
+ .
+ When /etc/ha-agent.status holds a line, that line is added to the reply,
+ which lets an operator drain or park a backend locally without taking it
+ offline. See the agent-check section of the HAProxy documentation.

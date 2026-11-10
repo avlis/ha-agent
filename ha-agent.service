@@ -1,21 +1,50 @@
 [Unit]
 Description=HAProxy Simple Agent
+Documentation=https://github.com/avlis/ha-agent
+Documentation=https://docs.haproxy.org/2.8/configuration.html#5.2-agent-check
 After=network.target
-StartLimitInterval=120
+# Restart rate limiting lives in [Unit] since systemd 230; in [Service] these
+# two names are not read at all.
+StartLimitIntervalSec=120
 StartLimitBurst=5
 
 [Service]
-EnvironmentFile=/etc/sysconfig/ha-agent
-StandardError=syslog
+# One unit file for both families: Debian/Ubuntu read /etc/default, RHEL and
+# friends read /etc/sysconfig. The "-" makes each line optional, so whichever
+# directory this distro uses is honoured and a missing one is not a failure.
+EnvironmentFile=-/etc/default/ha-agent
+EnvironmentFile=-/etc/sysconfig/ha-agent
 SyslogIdentifier=ha-agent
 TimeoutStopSec=30
 Restart=always
 RestartSec=30
 Type=simple
 User=ha-agent
+Group=ha-agent
 
-ExecStart=/usr/bin/python3 /usr/local/bin/ha-agent.py
-ExecStop=/bin/kill $MAINPID
+# Sandboxing. The agent reads /proc, one file under /etc and a socket, and writes
+# nothing, so these describe the shape it already had - written down so that
+# widening it later has to be a change here. ProtectSystem=full keeps /usr,
+# /boot and /etc read-only, which suits a program that only reads its drain
+# file. RestrictAddressFamilies lists what the agent may use: the two internet
+# families, plus AF_UNIX because journald's socket is one.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+ExecStart=/usr/bin/ha-agent
+# No ExecStop: systemd's default stop sends SIGTERM to the main process, which
+# the agent's own signal handler already turns into a clean shutdown.
 
 [Install]
 WantedBy=multi-user.target

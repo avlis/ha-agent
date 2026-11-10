@@ -1,0 +1,8 @@
+# The packaging containers COPY packaging/ only. Keeping the rest out of the
+# build context makes builds quick and stops artifacts or git objects from
+# invalidating the toolchain image cache.
+.git
+dist
+*.deb
+*.rpm
+error.txt

@@ -1,0 +1,8 @@
+# Build artifacts: ./package.sh writes these; they are not source.
+dist/
+*.deb
+*.rpm
+# Nothing may be added back with -f: the two December 2020 artifacts that used
+# to sit here were removed, and a built file must never be tracked again.
+# scratch
+pi_tmp_*

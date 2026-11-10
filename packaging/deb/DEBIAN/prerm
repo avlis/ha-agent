@@ -1,0 +1,27 @@
+#!/bin/sh
+# prerm for ha-agent
+#
+# Called as: prerm upgrade|failed-upgrade|remove|disconfigure|abort-install|abort-upgrade
+set -e
+
+SERVICE=ha-agent.service
+
+case "$1" in
+    remove|deconfigure)
+        # Stop while the files are still in place, then forget the enablement.
+        # deb-systemd-invoke does nothing when systemd is not running, which is
+        # what keeps `dpkg -r` working in a chroot or an image build.
+        if command -v deb-systemd-invoke >/dev/null 2>&1; then
+            deb-systemd-invoke --no-reload stop "$SERVICE" >/dev/null 2>&1 || true
+        fi
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper disable "$SERVICE" >/dev/null 2>&1 || true
+        fi
+        ;;
+    *)
+        # upgrade and friends: the files are replaced underneath the running
+        # process and postinst try-restarts it.
+        ;;
+esac
+
+exit 0
